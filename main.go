@@ -49,184 +49,269 @@ func hexValsToBytes(hexVals string) (_ []byte, more bool, _ error) {
 	return b, more, nil
 }
 
-func parse(s string) {
-	lines := strings.Split(s, "\n")
-	for i := 0; i < len(lines); i++ {
-		if !funcRe.MatchString(lines[i]) {
-			fmt.Println(lines[i])
+type parsed struct {
+	rawLines []string
+	funcs    []*fn
+}
+
+type fn struct {
+	name     string
+	pkgName  string
+	fileName string
+	line     int
+	pkg      *packages.Package
+	typ      *ast.FuncType
+	recv     *ast.FieldList
+
+	calls []call
+}
+
+type call struct {
+	rawLinesIdx int
+	argBytes    []byte
+	moreArgs    bool
+}
+
+func parseAndLoad(s string) parsed {
+	// Parse stacktrace
+	var (
+		pkgToFileToFuncs = make(map[string]map[string][]*fn)
+		funcByPath       = make(map[string]*fn)
+		loadPatterns     []string
+		rawLines         = strings.Split(s, "\n")
+	)
+	for i := 0; i < len(rawLines)-1; i++ {
+		if !funcRe.MatchString(rawLines[i]) {
 			continue
 		}
-		dot := strings.IndexByte(lines[i], '.')
-		pkgName := lines[i][:dot]
-		open := strings.IndexByte(lines[i], '(')
-		close := strings.IndexByte(lines[i], ')')
-		funcName := lines[i][dot+1 : open]
-		argBytes, more, err := hexValsToBytes(lines[i][open+1 : close])
-		if err != nil {
-			panic(err)
-		}
+		funcLine := rawLines[i]
+		rawIdx := i
 		i++
-
-		fileName := strings.TrimSpace(lines[i][:strings.IndexByte(lines[i], ':')])
-		fileLine := lines[i][strings.IndexByte(lines[i], ':')+1:]
-		if idx := strings.IndexByte(fileLine, ' '); idx != -1 {
-			fileLine = fileLine[:idx]
-		}
-		lineno, err := strconv.Atoi(fileLine)
-		if err != nil {
-			panic("unable to parse line number")
-		}
-		// TODO: be more efficient about loading
-		pkgs, err := packages.Load(&packages.Config{
-			Mode: packages.LoadTypes | packages.LoadSyntax,
-		}, "file="+fileName)
-		if err != nil {
-			panic(err)
-		}
-
-		var pkg *packages.Package
-		for _, p := range pkgs {
-			if p.Name != pkgName {
-				continue
-			}
-			pkg = p
-			break
-		}
-		if pkg == nil {
-			fmt.Println("Unable to find package.")
-			continue
-		}
-
-		var file *ast.File
-		for i := range pkg.CompiledGoFiles {
-			if fileName != pkg.CompiledGoFiles[i] {
-				continue
-			}
-			file = pkg.Syntax[i]
-			break
-		}
-		if file == nil {
-			fmt.Println("Unable to find file.")
-			continue
-		}
+		fileLine := rawLines[i]
 
 		var (
-			fn    *ast.FuncType
-			found bool
+			openIdx     = strings.LastIndexByte(funcLine, '(')
+			closeIdx    = strings.LastIndexByte(funcLine, ')')
+			funcPath    = funcLine[:openIdx]
+			dotFirstIdx = strings.IndexByte(funcPath, '.')
+			dotLastIdx  = strings.LastIndexByte(funcPath, '.')
 		)
-		ast.Walk(visitorFunc(func(n ast.Node) bool {
-			if n == nil {
-				return false
-			}
-			if found {
-				return false
-			}
-			// TODO: stop when found
-			switch n := n.(type) {
-			case *ast.FuncDecl:
-				if n.Name.Name != funcName {
-					break
-				}
+		argBytes, more, err := hexValsToBytes(funcLine[openIdx+1 : closeIdx])
+		if err != nil {
+			panic(err)
+		}
 
-				fn = n.Type
-				found = true
-				return false
-			case *ast.FuncLit:
-				fmt.Println(pkg.TypesInfo.Types[n.Type].Type)
-				startLine := pkg.Fset.Position(n.Pos()).Line
-				endLine := pkg.Fset.Position(n.End()).Line
-				if lineno >= startLine && lineno <= endLine {
-					fn = n.Type
-					found = true
-					return false
-				}
-			}
-			return true
-		}), file)
-		if fn == nil {
-			fmt.Printf("Unable to find declaration for %q.\n", funcName)
+		if fn, ok := funcByPath[funcPath]; ok {
+			fn.calls = append(fn.calls, call{
+				rawLinesIdx: rawIdx,
+				argBytes:    argBytes,
+				moreArgs:    more,
+			})
 			continue
 		}
 
-		// TODO: receiver
-		fmt.Printf("%s.%s(", pkgName, funcName)
-		var idx int
-		wordRemaining := int64(wordSize)
-	Outer:
-		for _, v := range fn.Params.List {
-			for _, n := range v.Names {
-				if idx != 0 {
-					fmt.Printf(", ")
+		colonIdx := strings.IndexByte(fileLine, ':')
+		fileName := strings.TrimSpace(fileLine[:colonIdx])
+		lineStr := fileLine[colonIdx+1:]
+		if idx := strings.IndexByte(lineStr, ' '); idx != -1 {
+			lineStr = lineStr[:idx]
+		}
+		lineno, err := strconv.Atoi(lineStr)
+		if err != nil {
+			panic("unable to parse line number: " + lineStr)
+		}
+
+		loadPatterns = append(loadPatterns, "file="+fileName)
+
+		f := &fn{
+			name:     funcLine[dotLastIdx+1 : openIdx],
+			pkgName:  funcLine[:dotFirstIdx],
+			fileName: fileName,
+			line:     lineno,
+			calls: []call{
+				{
+					argBytes:    argBytes,
+					moreArgs:    more,
+					rawLinesIdx: rawIdx,
+				},
+			},
+		}
+
+		filesToFunc, ok := pkgToFileToFuncs[f.pkgName]
+		if !ok {
+			pkgToFileToFuncs[f.pkgName] = map[string][]*fn{f.fileName: {f}}
+		} else {
+			filesToFunc[f.fileName] = append(filesToFunc[f.fileName], f)
+		}
+		funcByPath[funcPath] = f
+	}
+
+	// Load all relevant files
+	pkgs, err := packages.Load(&packages.Config{
+		Mode: packages.LoadTypes | packages.LoadSyntax,
+	}, loadPatterns...)
+	if err != nil {
+		panic(err)
+	}
+
+	// Match functions to their package and file
+	for _, pkg := range pkgs {
+		filesToFunc, ok := pkgToFileToFuncs[pkg.Name]
+		if !ok {
+			continue
+		}
+
+		for i := range pkg.CompiledGoFiles {
+			funcs, ok := filesToFunc[pkg.CompiledGoFiles[i]]
+			if !ok {
+				continue
+			}
+			astFile := pkg.Syntax[i]
+
+			byName := make(map[string]*fn)
+			for i, f := range funcs {
+				byName[f.name] = f
+				funcs[i].pkg = pkg
+			}
+
+			ast.Walk(visitorFunc(func(n ast.Node) bool {
+				if n == nil {
+					return false
 				}
 
-				typ := pkg.TypesInfo.Types[v.Type].Type
-				size := pkg.TypesSizes.Sizeof(typ)
-
-				// handle alignment
-				if size > wordRemaining && wordRemaining != int64(wordSize) {
-					argBytes = argBytes[wordRemaining:]
-					wordRemaining = int64(wordSize)
-				}
-				if size != 0 && size < int64(wordSize) {
-					toAlign := wordRemaining % size
-					argBytes = argBytes[toAlign:]
-					wordRemaining -= toAlign
-				}
-
-				if size > int64(len(argBytes)) {
-					if more {
-						fmt.Printf("...")
-					} else {
-						panic("unexpected size > len(argBytes)")
+				switch n := n.(type) {
+				case *ast.FuncDecl:
+					f, ok := byName[n.Name.Name]
+					if !ok {
+						break
 					}
-					break Outer
-				}
 
-				b := argBytes[:size]
-				if size < wordRemaining {
-					wordRemaining = wordRemaining - size
+					f.typ = n.Type
+					f.recv = n.Recv
+					delete(byName, f.name)
+				case *ast.FuncLit:
+					startLine := pkg.Fset.Position(n.Pos()).Line
+					endLine := pkg.Fset.Position(n.End()).Line
+					for _, f := range byName {
+						if f.line < startLine || f.line > endLine {
+							continue
+						}
+						f.typ = n.Type
+						delete(byName, f.name)
+					}
+				}
+				return true
+			}), astFile)
+		}
+	}
+
+	var funcs []*fn
+	for _, fileToFuncs := range pkgToFileToFuncs {
+		for _, fs := range fileToFuncs {
+			funcs = append(funcs, fs...)
+		}
+	}
+
+	return parsed{
+		rawLines: rawLines,
+		funcs:    funcs,
+	}
+}
+
+func writeArgs(f *fn, fields []*ast.Field, argBytes []byte, moreArgs bool, buf *strings.Builder) (remainingArgBytes []byte) {
+	var idx int
+	wordRemaining := int64(len(argBytes)) % int64(wordSize)
+Outer:
+	for _, field := range fields {
+		for _, n := range field.Names {
+			if idx != 0 {
+				buf.WriteString(", ")
+			}
+
+			typ := f.pkg.TypesInfo.Types[field.Type].Type
+			size := f.pkg.TypesSizes.Sizeof(typ)
+
+			// handle alignment
+			if size > wordRemaining && wordRemaining != int64(wordSize) {
+				argBytes = argBytes[wordRemaining:]
+				wordRemaining = int64(wordSize)
+			}
+			if size != 0 && size < int64(wordSize) {
+				toAlign := wordRemaining % size
+				argBytes = argBytes[toAlign:]
+				wordRemaining -= toAlign
+			}
+
+			if size > int64(len(argBytes)) {
+				if moreArgs {
+					buf.WriteString("...")
 				} else {
-					wordRemaining = int64(wordSize) - (size % int64(wordSize))
+					panic("unexpected size > len(argBytes)")
 				}
-
-				argBytes = argBytes[size:]
-				var buf strings.Builder // TODO: bytes.Buffer or accept interface
-				formatType(pkg.TypesSizes, typ, b, &buf)
-				fmt.Printf("%s %s", n.Name, buf.String())
-				idx++
+				break Outer
 			}
-		}
-		fmt.Printf(")")
 
-		if fn.Results != nil {
-			fmt.Printf(" (")
-			idx = 0
-			for _, v := range fn.Results.List {
-				for _, n := range v.Names {
-					if idx != 0 {
-						fmt.Printf(", ")
-					}
-
-					typ := pkg.TypesInfo.Types[v.Type].Type
-					size := pkg.TypesSizes.Sizeof(typ)
-					b := argBytes[:size]
-					argBytes = argBytes[size:]
-					revBytes(b)
-					var buf strings.Builder // TODO: bytes.Buffer or accept interface
-					formatType(pkg.TypesSizes, typ, b, &buf)
-					fmt.Printf("%s %s", n.Name, buf.String())
-					idx++
-				}
+			b := argBytes[:size]
+			if size < wordRemaining {
+				wordRemaining = wordRemaining - size
+			} else {
+				wordRemaining = int64(wordSize) - (size % int64(wordSize))
 			}
-			fmt.Printf(")")
+
+			argBytes = argBytes[size:]
+			fmt.Fprintf(buf, "%s ", n.Name)
+			formatType(f.pkg.TypesSizes, typ, b, buf)
+			idx++
 		}
-		fmt.Printf("\n%s\n", lines[i])
+	}
+	return remainingArgBytes
+}
+
+func parse(s string) {
+	p := parseAndLoad(s)
+
+	for _, f := range p.funcs {
+		if f.typ == nil {
+			fmt.Printf("Unable to find declaration for %q.\n", f.name)
+			continue
+		}
+
+		for _, call := range f.calls {
+			var buf strings.Builder // TODO: bytes.Buffer or accept interface
+			remainingArgBytes := call.argBytes
+
+			fmt.Fprintf(&buf, "%s.", f.pkgName)
+			if f.recv != nil {
+				buf.WriteByte('(')
+				remainingArgBytes = writeArgs(f, f.recv.List, remainingArgBytes, call.moreArgs, &buf)
+				buf.WriteString(").")
+			}
+			fmt.Fprintf(&buf, "%s(", f.name)
+
+			remainingArgBytes = writeArgs(f, f.typ.Params.List, remainingArgBytes, call.moreArgs, &buf)
+			buf.WriteByte(')')
+
+			if f.typ.Results != nil {
+				fmt.Fprintf(&buf, " (")
+				writeArgs(f, f.typ.Results.List, remainingArgBytes, call.moreArgs, &buf)
+				fmt.Fprintf(&buf, ")")
+			}
+
+			p.rawLines[call.rawLinesIdx] = buf.String()
+		}
+	}
+
+	for _, l := range p.rawLines {
+		println(l)
 	}
 }
 
 // TODO: handle differing arch sizes
 func formatType(typeSizes types.Sizes, typ types.Type, b []byte, buf *strings.Builder) {
 	name := typ.String()
+	if strings.HasPrefix(name, "*") {
+		buf.WriteByte('*')
+	}
 	if idx := strings.LastIndexByte(name, '.'); idx != -1 {
 		name = name[idx+1:]
 	}
@@ -356,16 +441,6 @@ func formatPtr(b []byte) string {
 		return "nil"
 	}
 	return fmt.Sprintf("%#x", p)
-}
-
-func revBytes(b []byte) {
-	start := 0
-	end := len(b) - 1
-	for start < end {
-		b[start], b[end] = b[end], b[start]
-		start++
-		end--
-	}
 }
 
 type visitorFunc func(ast.Node) bool
