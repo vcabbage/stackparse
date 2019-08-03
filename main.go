@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
 	"go/types"
@@ -23,30 +24,27 @@ func main() {
 	parse(string(p))
 }
 
-var funcRe = regexp.MustCompile(`^.+\..+\(.*\)$`)
+func parse(s string) {
+	p := parseAndLoad(s)
 
-const wordSize = unsafe.Sizeof(uintptr(0))
+	var buf bytes.Buffer
 
-func hexValsToBytes(hexVals string) (_ []byte, more bool, _ error) {
-	if hexVals == "" {
-		return nil, false, nil
+	for _, f := range p.funcs {
+		if f.typ == nil {
+			fmt.Printf("Unable to find declaration for %q.\n", f.name)
+			continue
+		}
+
+		for _, call := range f.calls {
+			buf.Reset()
+			writeFunc(f, call, &buf)
+			p.rawLines[call.rawLinesIdx] = buf.String()
+		}
 	}
 
-	var b []byte
-	for _, val := range strings.Split(hexVals, ", ") {
-		if val == "..." {
-			more = true
-			break
-		}
-		val := strings.TrimPrefix(val, "0x")
-		n, err := strconv.ParseUint(val, 16, int(wordSize)*8)
-		if err != nil {
-			return nil, false, err
-		}
-		b = append(b, (*(*[wordSize]byte)(unsafe.Pointer(&n)))[:]...)
+	for _, l := range p.rawLines {
+		println(l)
 	}
-
-	return b, more, nil
 }
 
 type parsed struct {
@@ -71,6 +69,8 @@ type call struct {
 	argBytes    []byte
 	moreArgs    bool
 }
+
+var funcRe = regexp.MustCompile(`^.+\..+\(.*\)$`)
 
 func parseAndLoad(s string) parsed {
 	// Parse stacktrace
@@ -200,6 +200,7 @@ func parseAndLoad(s string) parsed {
 						delete(byName, f.name)
 					}
 				}
+
 				return true
 			}), astFile)
 		}
@@ -218,7 +219,52 @@ func parseAndLoad(s string) parsed {
 	}
 }
 
-func writeArgs(f *fn, fields []*ast.Field, argBytes []byte, moreArgs bool, buf *strings.Builder) (remainingArgBytes []byte) {
+const wordSize = unsafe.Sizeof(uintptr(0))
+
+func hexValsToBytes(hexVals string) (_ []byte, more bool, _ error) {
+	if hexVals == "" {
+		return nil, false, nil
+	}
+
+	var b []byte
+	for _, val := range strings.Split(hexVals, ", ") {
+		if val == "..." {
+			more = true
+			break
+		}
+		val := strings.TrimPrefix(val, "0x")
+		n, err := strconv.ParseUint(val, 16, int(wordSize)*8)
+		if err != nil {
+			return nil, false, err
+		}
+		b = append(b, (*(*[wordSize]byte)(unsafe.Pointer(&n)))[:]...)
+	}
+
+	return b, more, nil
+}
+
+func writeFunc(f *fn, call call, buf *bytes.Buffer) {
+	remainingArgBytes := call.argBytes
+
+	fmt.Fprintf(buf, "%s.", f.pkgName)
+	if f.recv != nil {
+		buf.WriteByte('(')
+		remainingArgBytes = writeArgs(f, f.recv.List, remainingArgBytes, call.moreArgs, buf)
+		buf.WriteString(").")
+	}
+	fmt.Fprintf(buf, "%s(", f.name)
+
+	remainingArgBytes = writeArgs(f, f.typ.Params.List, remainingArgBytes, call.moreArgs, buf)
+	buf.WriteByte(')')
+
+	if f.typ.Results != nil {
+		fmt.Fprintf(buf, " (")
+		writeArgs(f, f.typ.Results.List, remainingArgBytes, call.moreArgs, buf)
+		fmt.Fprintf(buf, ")")
+	}
+}
+
+func writeArgs(f *fn, fields []*ast.Field, argBytes []byte, moreArgs bool, buf *bytes.Buffer) (remainingArgBytes []byte) {
 	var idx int
 	wordRemaining := int64(len(argBytes)) % int64(wordSize)
 Outer:
@@ -267,47 +313,8 @@ Outer:
 	return remainingArgBytes
 }
 
-func parse(s string) {
-	p := parseAndLoad(s)
-
-	for _, f := range p.funcs {
-		if f.typ == nil {
-			fmt.Printf("Unable to find declaration for %q.\n", f.name)
-			continue
-		}
-
-		for _, call := range f.calls {
-			var buf strings.Builder // TODO: bytes.Buffer or accept interface
-			remainingArgBytes := call.argBytes
-
-			fmt.Fprintf(&buf, "%s.", f.pkgName)
-			if f.recv != nil {
-				buf.WriteByte('(')
-				remainingArgBytes = writeArgs(f, f.recv.List, remainingArgBytes, call.moreArgs, &buf)
-				buf.WriteString(").")
-			}
-			fmt.Fprintf(&buf, "%s(", f.name)
-
-			remainingArgBytes = writeArgs(f, f.typ.Params.List, remainingArgBytes, call.moreArgs, &buf)
-			buf.WriteByte(')')
-
-			if f.typ.Results != nil {
-				fmt.Fprintf(&buf, " (")
-				writeArgs(f, f.typ.Results.List, remainingArgBytes, call.moreArgs, &buf)
-				fmt.Fprintf(&buf, ")")
-			}
-
-			p.rawLines[call.rawLinesIdx] = buf.String()
-		}
-	}
-
-	for _, l := range p.rawLines {
-		println(l)
-	}
-}
-
 // TODO: handle differing arch sizes
-func formatType(typeSizes types.Sizes, typ types.Type, b []byte, buf *strings.Builder) {
+func formatType(typeSizes types.Sizes, typ types.Type, b []byte, buf *bytes.Buffer) {
 	name := typ.String()
 	if strings.HasPrefix(name, "*") {
 		buf.WriteByte('*')
