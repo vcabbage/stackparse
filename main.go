@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/types"
-	"io/ioutil"
+	"io"
 	"os"
 	"reflect"
 	"regexp"
@@ -17,32 +17,14 @@ import (
 )
 
 func main() {
-	p, err := ioutil.ReadAll(os.Stdin)
+	var buf strings.Builder
+	_, err := io.Copy(&buf, os.Stdin)
 	if err != nil {
 		panic(err)
 	}
-	parse(string(p))
-}
 
-func parse(s string) {
-	p := parseAndLoad(s)
-
-	var buf bytes.Buffer
-
-	for _, f := range p.funcs {
-		if f.typ == nil {
-			fmt.Printf("Unable to find declaration for %q.\n", f.name)
-			continue
-		}
-
-		for _, call := range f.calls {
-			buf.Reset()
-			writeFunc(f, call, &buf)
-			p.rawLines[call.rawLinesIdx] = buf.String()
-		}
-	}
-
-	for _, l := range p.rawLines {
+	lines := parse(buf.String())
+	for _, l := range lines {
 		println(l)
 	}
 }
@@ -72,7 +54,7 @@ type call struct {
 
 var funcRe = regexp.MustCompile(`^.+\..+\(.*\)$`)
 
-func parseAndLoad(s string) parsed {
+func parse(s string) []string {
 	// Parse stacktrace
 	var (
 		pkgToFileToFuncs = make(map[string]map[string][]*fn)
@@ -154,6 +136,8 @@ func parseAndLoad(s string) parsed {
 		panic(err)
 	}
 
+	var buf bytes.Buffer
+
 	// Match functions to their package and file
 	for _, pkg := range pkgs {
 		filesToFunc, ok := pkgToFileToFuncs[pkg.Name]
@@ -188,6 +172,12 @@ func parseAndLoad(s string) parsed {
 
 					f.typ = n.Type
 					f.recv = n.Recv
+
+					for _, call := range f.calls {
+						buf.Reset()
+						writeFunc(f, call, &buf)
+						rawLines[call.rawLinesIdx] = buf.String()
+					}
 					delete(byName, f.name)
 				case *ast.FuncLit:
 					startLine := pkg.Fset.Position(n.Pos()).Line
@@ -197,6 +187,12 @@ func parseAndLoad(s string) parsed {
 							continue
 						}
 						f.typ = n.Type
+
+						for _, call := range f.calls {
+							buf.Reset()
+							writeFunc(f, call, &buf)
+							rawLines[call.rawLinesIdx] = buf.String()
+						}
 						delete(byName, f.name)
 					}
 				}
@@ -206,17 +202,7 @@ func parseAndLoad(s string) parsed {
 		}
 	}
 
-	var funcs []*fn
-	for _, fileToFuncs := range pkgToFileToFuncs {
-		for _, fs := range fileToFuncs {
-			funcs = append(funcs, fs...)
-		}
-	}
-
-	return parsed{
-		rawLines: rawLines,
-		funcs:    funcs,
-	}
+	return rawLines
 }
 
 const wordSize = unsafe.Sizeof(uintptr(0))
@@ -244,77 +230,130 @@ func hexValsToBytes(hexVals string) (_ []byte, more bool, _ error) {
 }
 
 func writeFunc(f *fn, call call, buf *bytes.Buffer) {
-	remainingArgBytes := call.argBytes
+	ar := newArgReader(f.pkg.TypesSizes, call.argBytes, call.moreArgs)
 
 	fmt.Fprintf(buf, "%s.", f.pkgName)
 	if f.recv != nil {
 		buf.WriteByte('(')
-		remainingArgBytes = writeArgs(f, f.recv.List, remainingArgBytes, call.moreArgs, buf)
+		writeArgs(f, f.recv.List, ar, buf)
 		buf.WriteString(").")
 	}
 	fmt.Fprintf(buf, "%s(", f.name)
 
-	remainingArgBytes = writeArgs(f, f.typ.Params.List, remainingArgBytes, call.moreArgs, buf)
+	writeArgs(f, f.typ.Params.List, ar, buf)
 	buf.WriteByte(')')
 
 	if f.typ.Results != nil {
 		fmt.Fprintf(buf, " (")
-		writeArgs(f, f.typ.Results.List, remainingArgBytes, call.moreArgs, buf)
+		writeArgs(f, f.typ.Results.List, ar, buf)
 		fmt.Fprintf(buf, ")")
 	}
 }
 
-func writeArgs(f *fn, fields []*ast.Field, argBytes []byte, moreArgs bool, buf *bytes.Buffer) (remainingArgBytes []byte) {
+func writeArgs(f *fn, fields []*ast.Field, ar *argReader, buf *bytes.Buffer) {
 	var idx int
-	wordRemaining := int64(len(argBytes)) % int64(wordSize)
-Outer:
 	for _, field := range fields {
 		for _, n := range field.Names {
 			if idx != 0 {
 				buf.WriteString(", ")
 			}
-
 			typ := f.pkg.TypesInfo.Types[field.Type].Type
-			size := f.pkg.TypesSizes.Sizeof(typ)
 
-			// handle alignment
-			if size > wordRemaining && wordRemaining != int64(wordSize) {
-				argBytes = argBytes[wordRemaining:]
-				wordRemaining = int64(wordSize)
-			}
-			if size != 0 && size < int64(wordSize) {
-				toAlign := wordRemaining % size
-				argBytes = argBytes[toAlign:]
-				wordRemaining -= toAlign
-			}
-
-			if size > int64(len(argBytes)) {
-				if moreArgs {
-					buf.WriteString("...")
-				} else {
-					panic("unexpected size > len(argBytes)")
-				}
-				break Outer
-			}
-
-			b := argBytes[:size]
-			if size < wordRemaining {
-				wordRemaining = wordRemaining - size
-			} else {
-				wordRemaining = int64(wordSize) - (size % int64(wordSize))
-			}
-
-			argBytes = argBytes[size:]
 			fmt.Fprintf(buf, "%s ", n.Name)
-			formatType(f.pkg.TypesSizes, typ, b, buf)
+			ok := formatType(f.pkg.TypesSizes, typ, ar, buf)
+			if !ok {
+				return
+			}
 			idx++
 		}
 	}
-	return remainingArgBytes
 }
 
-// TODO: handle differing arch sizes
-func formatType(typeSizes types.Sizes, typ types.Type, b []byte, buf *bytes.Buffer) {
+type argReader struct {
+	sizes         types.Sizes
+	remaining     []byte
+	wordRemaining int64
+	moreArgs      bool
+}
+
+func newArgReader(sizes types.Sizes, argBytes []byte, moreArgs bool) *argReader {
+	return &argReader{
+		sizes:         sizes,
+		remaining:     argBytes,
+		wordRemaining: int64(len(argBytes)) % int64(wordSize),
+		moreArgs:      moreArgs,
+	}
+}
+
+func (r *argReader) read(typ types.Type) ([]byte, bool) {
+	size := r.sizes.Sizeof(typ)
+
+	// handle alignment
+	if size > r.wordRemaining && r.wordRemaining != int64(wordSize) {
+		r.remaining = r.remaining[r.wordRemaining:]
+		r.wordRemaining = int64(wordSize)
+	}
+	if size != 0 && size < int64(wordSize) {
+		toAlign := r.wordRemaining % size
+		r.remaining = r.remaining[toAlign:]
+		r.wordRemaining -= toAlign
+	}
+
+	if size > int64(len(r.remaining)) {
+		if !r.moreArgs {
+			panic("unexpected size > len(argBytes)")
+		}
+		return r.remaining, false
+	}
+
+	b := r.remaining[:size]
+	if size < r.wordRemaining {
+		r.wordRemaining = r.wordRemaining - size
+	} else {
+		r.wordRemaining = int64(wordSize) - (size % int64(wordSize))
+	}
+
+	r.remaining = r.remaining[size:]
+
+	return b, true
+}
+
+type structReader struct {
+	sizes   types.Sizes
+	offsets []int64
+	idx     int
+	b       []byte
+}
+
+func newStructReader(sizes types.Sizes, fields []*types.Var, b []byte) *structReader {
+	return &structReader{
+		sizes:   sizes,
+		offsets: sizes.Offsetsof(fields),
+		b:       b,
+	}
+}
+
+func (r *structReader) read(typ types.Type) ([]byte, bool) {
+	offset := r.offsets[r.idx]
+	r.idx++
+	size := r.sizes.Sizeof(typ)
+
+	if int64(len(r.b)) <= offset {
+		return nil, false
+	}
+
+	if int64(len(r.b)) < offset+size {
+		return r.b[offset:], false
+	}
+
+	return r.b[offset : offset+size], true
+}
+
+type reader interface {
+	read(typ types.Type) ([]byte, bool)
+}
+
+func writeArgName(typ types.Type, buf *bytes.Buffer) {
 	name := typ.String()
 	if strings.HasPrefix(name, "*") {
 		buf.WriteByte('*')
@@ -323,22 +362,90 @@ func formatType(typeSizes types.Sizes, typ types.Type, b []byte, buf *bytes.Buff
 		name = name[idx+1:]
 	}
 	buf.WriteString(name)
+}
 
-	switch typ := typ.Underlying().(type) {
+// TODO: handle differing arch sizes
+func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buffer) bool {
+	// Compound types
+	switch utyp := typ.Underlying().(type) {
 	case *types.Array:
-		l := int(typ.Len())
-		elem := typ.Elem()
-		elemSize := typeSizes.Sizeof(elem)
+		writeArgName(typ, buf)
+
+		l := int(utyp.Len())
+		elem := utyp.Elem()
+
+		var ok bool
 
 		buf.WriteByte('[')
 		for i := 0; i < l; i++ {
 			if i != 0 {
 				buf.WriteString(", ")
 			}
-			formatType(typeSizes, elem, b[:elemSize], buf)
-			b = b[elemSize:]
+			ok = formatType(typeSizes, elem, ar, buf)
+			if !ok {
+				break
+			}
 		}
 		buf.WriteByte(']')
+		return ok
+
+	case *types.Struct:
+		writeArgName(typ, buf)
+
+		// TODO: handle incomplete structs
+		b, _ := ar.read(typ)
+
+		fields := make([]*types.Var, utyp.NumFields())
+		for i := range fields {
+			fields[i] = utyp.Field(i)
+		}
+		sr := newStructReader(typeSizes, fields, b)
+
+		var ok bool
+		buf.WriteRune('{')
+		for i, field := range fields {
+			if i != 0 {
+				buf.WriteString(", ")
+			}
+			buf.WriteString(field.Name())
+			buf.WriteString(": ")
+
+			fieldTyp := field.Type()
+			ok = formatType(typeSizes, fieldTyp, sr, buf)
+			if !ok {
+				break
+			}
+		}
+		buf.WriteRune('}')
+
+		return ok
+	}
+
+	b, ok := ar.read(typ)
+	if !ok {
+		buf.WriteString("...")
+		return false
+	}
+
+	writeArgName(typ, buf)
+	switch typ := typ.Underlying().(type) {
+	case *types.Chan:
+		buf.WriteString("(" + formatPtr(b) + ")")
+	case *types.Interface:
+		// interfaces are two pointers: type and data
+		fmt.Fprintf(buf, "{type: %s, data: %s}",
+			formatPtr(b[:wordSize]),
+			formatPtr(b[wordSize:]),
+		)
+	case *types.Map:
+		buf.WriteString("(" + formatPtr(b) + ")")
+	case *types.Pointer:
+		buf.WriteString("(" + formatPtr(b) + ")")
+	case *types.Signature:
+		buf.WriteString("(" + formatPtr(b) + ")")
+	case *types.Slice:
+		t := *(*reflect.SliceHeader)(unsafe.Pointer(&b[0]))
+		fmt.Fprintf(buf, "{data: %s, len: %d, cap: %d}", b[:wordSize], t.Len, t.Cap)
 	case *types.Basic:
 		switch typ.Kind() {
 		case types.Bool:
@@ -401,45 +508,10 @@ func formatType(typeSizes types.Sizes, typ types.Type, b []byte, buf *bytes.Buff
 		default:
 			panic("unhandled basic type: " + typ.String())
 		}
-	case *types.Chan:
-		buf.WriteString("(" + formatPtr(b) + ")")
-	case *types.Interface:
-		// interfaces are two pointers: type and data
-		fmt.Fprintf(buf, "{type: %s, data: %s}", formatPtr(b[:wordSize]), b[wordSize:])
-	case *types.Map:
-		buf.WriteString("(" + formatPtr(b) + ")")
-	case *types.Pointer:
-		buf.WriteString("(" + formatPtr(b) + ")")
-	case *types.Signature:
-		buf.WriteString("(" + formatPtr(b) + ")")
-	case *types.Slice:
-		t := *(*reflect.SliceHeader)(unsafe.Pointer(&b[0]))
-		fmt.Fprintf(buf, "{data: %s, len: %d, cap: %d}", b[:wordSize], t.Len, t.Cap)
-	case *types.Struct:
-		fields := make([]*types.Var, typ.NumFields())
-		for i := range fields {
-			fields[i] = typ.Field(i)
-		}
-		offsets := typeSizes.Offsetsof(fields)
-
-		buf.WriteRune('{')
-		for i, field := range fields {
-			if i != 0 {
-				buf.WriteString(", ")
-			}
-			var (
-				fieldTyp = field.Type()
-				offset   = offsets[i]
-				size     = typeSizes.Sizeof(fieldTyp)
-			)
-			buf.WriteString(field.Name())
-			buf.WriteString(": ")
-			formatType(typeSizes, fieldTyp, b[offset:offset+size], buf)
-		}
-		buf.WriteRune('}')
 	default:
 		panic("unhandled underlying type: " + typ.String())
 	}
+	return true
 }
 
 func formatPtr(b []byte) string {
