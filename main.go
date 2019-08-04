@@ -260,7 +260,7 @@ func writeArgs(f *fn, fields []*ast.Field, ar *argReader, buf *bytes.Buffer) {
 			typ := f.pkg.TypesInfo.Types[field.Type].Type
 
 			fmt.Fprintf(buf, "%s ", n.Name)
-			ok := formatType(f.pkg.TypesSizes, typ, ar, buf)
+			ok := formatType(f.pkg.TypesSizes, typ, ar, buf, false)
 			if !ok {
 				return
 			}
@@ -365,11 +365,13 @@ func writeArgName(typ types.Type, buf *bytes.Buffer) {
 }
 
 // TODO: handle differing arch sizes
-func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buffer) bool {
+func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buffer, suppressTypeName bool) bool {
 	// Compound types
 	switch utyp := typ.Underlying().(type) {
 	case *types.Array:
-		writeArgName(typ, buf)
+		if !suppressTypeName {
+			writeArgName(typ, buf)
+		}
 
 		l := int(utyp.Len())
 		elem := utyp.Elem()
@@ -381,7 +383,7 @@ func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buf
 			if i != 0 {
 				buf.WriteString(", ")
 			}
-			ok = formatType(typeSizes, elem, ar, buf)
+			ok = formatType(typeSizes, elem, ar, buf, true)
 			if !ok {
 				break
 			}
@@ -390,7 +392,9 @@ func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buf
 		return ok
 
 	case *types.Struct:
-		writeArgName(typ, buf)
+		if !suppressTypeName {
+			writeArgName(typ, buf)
+		}
 
 		// TODO: handle incomplete structs
 		b, _ := ar.read(typ)
@@ -411,7 +415,7 @@ func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buf
 			buf.WriteString(": ")
 
 			fieldTyp := field.Type()
-			ok = formatType(typeSizes, fieldTyp, sr, buf)
+			ok = formatType(typeSizes, fieldTyp, sr, buf, false)
 			if !ok {
 				break
 			}
@@ -419,6 +423,43 @@ func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buf
 		buf.WriteRune('}')
 
 		return ok
+
+	case *types.Interface:
+		// interfaces are two pointers: type and data
+		b, ok := ar.read(typ)
+		if !ok {
+			buf.WriteString("...")
+			return false
+		}
+
+		fmt.Fprintf(buf, "{type: %s, data: %s}",
+			formatPtr(b[:wordSize]),
+			formatPtr(b[wordSize:]),
+		)
+	case *types.Slice:
+		b, ok := ar.read(typ)
+		if !ok {
+			buf.WriteString("...")
+			return false
+		}
+
+		t := *(*reflect.SliceHeader)(unsafe.Pointer(&b[0]))
+		fmt.Fprintf(buf, "{data: %s, len: %d, cap: %d}", b[:wordSize], t.Len, t.Cap)
+		return true
+
+	case *types.Basic:
+		switch utyp.Kind() {
+		case types.String:
+			b, ok := ar.read(typ)
+			if !ok {
+				buf.WriteString("...")
+				return false
+			}
+
+			t := *(*reflect.StringHeader)(unsafe.Pointer(&b[0]))
+			fmt.Fprintf(buf, "{data: %s, len: %d}", formatPtr(b[:wordSize]), t.Len)
+			return true
+		}
 	}
 
 	b, ok := ar.read(typ)
@@ -427,89 +468,80 @@ func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buf
 		return false
 	}
 
-	writeArgName(typ, buf)
+	if !suppressTypeName {
+		writeArgName(typ, buf)
+		buf.WriteRune('(')
+	}
 	switch typ := typ.Underlying().(type) {
-	case *types.Chan:
-		buf.WriteString("(" + formatPtr(b) + ")")
-	case *types.Interface:
-		// interfaces are two pointers: type and data
-		fmt.Fprintf(buf, "{type: %s, data: %s}",
-			formatPtr(b[:wordSize]),
-			formatPtr(b[wordSize:]),
-		)
-	case *types.Map:
-		buf.WriteString("(" + formatPtr(b) + ")")
-	case *types.Pointer:
-		buf.WriteString("(" + formatPtr(b) + ")")
-	case *types.Signature:
-		buf.WriteString("(" + formatPtr(b) + ")")
-	case *types.Slice:
-		t := *(*reflect.SliceHeader)(unsafe.Pointer(&b[0]))
-		fmt.Fprintf(buf, "{data: %s, len: %d, cap: %d}", b[:wordSize], t.Len, t.Cap)
+	case *types.Map,
+		*types.Pointer,
+		*types.Chan,
+		*types.Signature:
+		buf.WriteString(formatPtr(b))
 	case *types.Basic:
 		switch typ.Kind() {
 		case types.Bool:
 			t := *(*bool)(unsafe.Pointer(&b[0]))
 			if t {
-				buf.WriteString("(true)")
+				buf.WriteString("true")
 			} else {
-				buf.WriteString("(false)")
+				buf.WriteString("false")
 			}
 		case types.Int:
 			t := *(*int)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "(%v)", t)
+			fmt.Fprintf(buf, "%v", t)
 		case types.Int8:
 			t := *(*int8)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "(%v)", t)
+			fmt.Fprintf(buf, "%v", t)
 		case types.Int16:
 			t := *(*int16)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "(%v)", t)
+			fmt.Fprintf(buf, "%v", t)
 		case types.Int32:
 			t := *(*int32)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "(%v)", t)
+			fmt.Fprintf(buf, "%v", t)
 		case types.Int64:
 			t := *(*int64)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "(%v)", t)
+			fmt.Fprintf(buf, "%v", t)
 		case types.Uint:
 			t := *(*uint)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "(%v)", t)
+			fmt.Fprintf(buf, "%v", t)
 		case types.Uint8:
 			t := *(*uint8)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "(%v)", t)
+			fmt.Fprintf(buf, "%v", t)
 		case types.Uint16:
 			t := *(*uint16)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "(%v)", t)
+			fmt.Fprintf(buf, "%v", t)
 		case types.Uint32:
 			t := *(*uint32)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "(%v)", t)
+			fmt.Fprintf(buf, "%v", t)
 		case types.Uint64:
 			t := *(*uint64)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "(%v)", t)
+			fmt.Fprintf(buf, "%v", t)
 		case types.Uintptr:
 			t := *(*uintptr)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "(%v)", t)
+			fmt.Fprintf(buf, "%v", t)
 		case types.Float32:
 			t := *(*float32)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "(%v)", t)
+			fmt.Fprintf(buf, "%v", t)
 		case types.Float64:
 			t := *(*float64)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "(%v)", t)
+			fmt.Fprintf(buf, "%v", t)
 		case types.Complex64:
 			t := *(*complex64)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "(%v)", t)
+			fmt.Fprintf(buf, "%v", t)
 		case types.Complex128:
 			t := *(*complex128)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "(%v)", t)
-		case types.String:
-			t := *(*reflect.StringHeader)(unsafe.Pointer(&b[0]))
-			fmt.Fprintf(buf, "{data: %s, len: %d}", formatPtr(b[:wordSize]), t.Len)
+			fmt.Fprintf(buf, "%v", t)
 		case types.UnsafePointer:
-			buf.WriteString("(" + formatPtr(b) + ")")
+			buf.WriteString(formatPtr(b))
 		default:
 			panic("unhandled basic type: " + typ.String())
 		}
 	default:
 		panic("unhandled underlying type: " + typ.String())
+	}
+	if !suppressTypeName {
+		buf.WriteByte(')')
 	}
 	return true
 }
