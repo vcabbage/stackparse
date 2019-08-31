@@ -130,16 +130,25 @@ func parse(s string) []string {
 
 	// Load all relevant files
 	pkgs, err := packages.Load(&packages.Config{
-		Mode: packages.LoadTypes | packages.LoadSyntax,
+		Mode: packages.LoadTypes | packages.LoadSyntax | packages.LoadImports | packages.LoadAllSyntax,
 	}, loadPatterns...)
 	if err != nil {
 		panic(err)
 	}
 
+	// Collect all direct and imported packages.
+	pkgMap := make(map[string]*packages.Package)
+	for _, pkg := range pkgs {
+		pkgMap[pkg.ID] = pkg
+		for _, imp := range pkg.Imports {
+			pkgMap[imp.ID] = imp
+		}
+	}
+
 	var buf bytes.Buffer
 
 	// Match functions to their package and file
-	for _, pkg := range pkgs {
+	for _, pkg := range pkgMap {
 		filesToFunc, ok := pkgToFileToFuncs[pkg.Name]
 		if !ok {
 			continue
@@ -260,7 +269,7 @@ func writeArgs(f *fn, fields []*ast.Field, ar *argReader, buf *bytes.Buffer) {
 			typ := f.pkg.TypesInfo.Types[field.Type].Type
 
 			fmt.Fprintf(buf, "%s ", n.Name)
-			ok := formatType(f.pkg.TypesSizes, typ, ar, buf, false)
+			ok := formatType(f.pkg.TypesSizes, typ, f.pkg.PkgPath, ar, buf, false)
 			if !ok {
 				return
 			}
@@ -300,9 +309,9 @@ func (r *argReader) read(typ types.Type) ([]byte, bool) {
 	}
 
 	if size > int64(len(r.remaining)) {
-		if !r.moreArgs {
-			panic("unexpected size > len(argBytes)")
-		}
+		// if !r.moreArgs {
+		// 	panic("unexpected size > len(argBytes)")
+		// }
 		return r.remaining, false
 	}
 
@@ -353,24 +362,27 @@ type reader interface {
 	read(typ types.Type) ([]byte, bool)
 }
 
-func writeArgName(typ types.Type, buf *bytes.Buffer) {
+func writeArgName(typ types.Type, pkgPath string, buf *bytes.Buffer) {
 	name := typ.String()
-	if strings.HasPrefix(name, "*") {
-		buf.WriteByte('*')
+
+	// remove package path from type name when defined in same package as function
+	name = strings.Replace(name, pkgPath+".", "", -1)
+
+	// wrap functions signatures in parens
+	if strings.Contains(name, " ") {
+		name = "(" + name + ")"
 	}
-	if idx := strings.LastIndexByte(name, '.'); idx != -1 {
-		name = name[idx+1:]
-	}
+
 	buf.WriteString(name)
 }
 
 // TODO: handle differing arch sizes
-func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buffer, suppressTypeName bool) bool {
+func formatType(typeSizes types.Sizes, typ types.Type, pkgPath string, ar reader, buf *bytes.Buffer, suppressTypeName bool) bool {
 	// Compound types
 	switch utyp := typ.Underlying().(type) {
 	case *types.Array:
 		if !suppressTypeName {
-			writeArgName(typ, buf)
+			writeArgName(typ, pkgPath, buf)
 		}
 
 		l := int(utyp.Len())
@@ -383,7 +395,7 @@ func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buf
 			if i != 0 {
 				buf.WriteString(", ")
 			}
-			ok = formatType(typeSizes, elem, ar, buf, true)
+			ok = formatType(typeSizes, elem, pkgPath, ar, buf, true)
 			if !ok {
 				break
 			}
@@ -393,7 +405,7 @@ func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buf
 
 	case *types.Struct:
 		if !suppressTypeName {
-			writeArgName(typ, buf)
+			writeArgName(typ, pkgPath, buf)
 		}
 
 		// TODO: handle incomplete structs
@@ -415,7 +427,7 @@ func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buf
 			buf.WriteString(": ")
 
 			fieldTyp := field.Type()
-			ok = formatType(typeSizes, fieldTyp, sr, buf, false)
+			ok = formatType(typeSizes, fieldTyp, pkgPath, sr, buf, false)
 			if !ok {
 				break
 			}
@@ -432,10 +444,15 @@ func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buf
 			return false
 		}
 
+		if !suppressTypeName {
+			writeArgName(typ, pkgPath, buf)
+		}
 		fmt.Fprintf(buf, "{type: %s, data: %s}",
 			formatPtr(b[:wordSize]),
 			formatPtr(b[wordSize:]),
 		)
+		return true
+
 	case *types.Slice:
 		b, ok := ar.read(typ)
 		if !ok {
@@ -443,8 +460,12 @@ func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buf
 			return false
 		}
 
+		if !suppressTypeName {
+			writeArgName(typ, pkgPath, buf)
+		}
+
 		t := *(*reflect.SliceHeader)(unsafe.Pointer(&b[0]))
-		fmt.Fprintf(buf, "{data: %s, len: %d, cap: %d}", b[:wordSize], t.Len, t.Cap)
+		fmt.Fprintf(buf, "{data: %s, len: %d, cap: %d}", formatPtr(b[:wordSize]), t.Len, t.Cap)
 		return true
 
 	case *types.Basic:
@@ -454,6 +475,10 @@ func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buf
 			if !ok {
 				buf.WriteString("...")
 				return false
+			}
+
+			if !suppressTypeName {
+				writeArgName(typ, pkgPath, buf)
 			}
 
 			t := *(*reflect.StringHeader)(unsafe.Pointer(&b[0]))
@@ -469,7 +494,7 @@ func formatType(typeSizes types.Sizes, typ types.Type, ar reader, buf *bytes.Buf
 	}
 
 	if !suppressTypeName {
-		writeArgName(typ, buf)
+		writeArgName(typ, pkgPath, buf)
 		buf.WriteRune('(')
 	}
 	switch typ := typ.Underlying().(type) {
