@@ -42,9 +42,9 @@ goroutine 1 [running]:
 panic(0x45b1a0, 0x47ced0)
 	/home/kale/goroots/go1.12/src/runtime/panic.go:565 +0x2c5 fp=0xc000048710 sp=0xc000048680 pc=0x423135
 main.MyFunc(0x24507b, 0x0, 0x46f1c5, 0x5, 0x4c, 0xc000016001, 0x315, 0x1, 0x2, 0x3, ...)
-	/home/kale/go/src/github.com/vcabbage/stackparse/example2/main.go:17 +0x39 fp=0xc000048730 sp=0xc000048710 pc=0x44f9f9
+	/home/kale/go/src/github.com/vcabbage/example/main.go:17 +0x39 fp=0xc000048730 sp=0xc000048710 pc=0x44f9f9
 main.main()
-	/home/kale/go/src/github.com/vcabbage/stackparse/example2/main.go:10 +0x7a fp=0xc000048798 sp=0xc000048730 pc=0x44f9aa
+	/home/kale/go/src/github.com/vcabbage/example/main.go:10 +0x7a fp=0xc000048798 sp=0xc000048730 pc=0x44f9aa
 runtime.main()
 	/home/kale/goroots/go1.12/src/runtime/proc.go:200 +0x20c fp=0xc0000487e0 sp=0xc000048798 pc=0x424e1c
 runtime.goexit()
